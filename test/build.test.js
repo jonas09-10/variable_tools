@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { unzipSync } = require('fflate');
-const { build, output } = require('../scripts/build-rbz');
+const { execFileSync } = require('node:child_process');
+const output = path.join(__dirname, '..', 'dist', 'variable_tools.rbz');
 
 const root = path.resolve(__dirname, '..');
 function sourceFiles(dir, prefix) {
@@ -13,8 +14,8 @@ function sourceFiles(dir, prefix) {
     return entry.isDirectory() ? sourceFiles(file, name) : [name];
   });
 }
-test('RBZ contains exactly the extension files with unchanged contents', () => {
-  build();
+test('RBZ contains exactly the extension files with unchanged contents', { skip: process.platform !== 'win32' }, () => {
+  execFileSync('cmd.exe', ['/d', '/s', '/c', 'build.bat'], { cwd: root });
   const archive = unzipSync(fs.readFileSync(output));
   const expected = ['variable_tools.rb', ...sourceFiles(path.join(root, 'variable_tools'), 'variable_tools')].sort();
   assert.deepEqual(Object.keys(archive).sort(), expected);
