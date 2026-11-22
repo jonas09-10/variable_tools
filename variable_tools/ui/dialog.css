@@ -33,6 +33,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); }
 .toolbar, .sheet-tabs { border-color: var(--line); }
 .toolbar > * { margin-right: 6px; }
 .toolbar > :last-child { margin-right: 0; }
+.color-controls > button { margin-left: 6px; }
 
 button.control, .select-control {
   border: 1px solid var(--line);

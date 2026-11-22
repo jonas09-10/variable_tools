@@ -105,21 +105,23 @@
           <button type="button" class="control" @click="callRuby(sheet.id + '_add_col')">+ Column</button>
           <button type="button" class="control" x-show="sheet.id === 'structural'"
             title="Delete selected rows and their SketchUp geometry" @click="deletePickedStructural(sheet)">Delete Selected</button>
-          <label class="whitespace-nowrap">Color by
-            <select class="select-control" x-model="sheet.colorBy" @change="callRuby(sheet.id + '_filter', $el.value)">
-              <option value="none">None</option>
-              <template x-for="col in sheet.columns.filter((col) => col.name)" :key="col.id">
-                <option :value="col.id" x-text="col.name"></option>
-              </template>
-            </select>
-          </label>
-          <button type="button" class="control" @click="callRuby(sheet.id + '_filter', 'none')">Clear colors</button>
           <button type="button" class="control" x-show="sheet.id !== 'tab'" @click="selectVisible(sheet)">Select Visible</button>
           <button type="button" class="control" x-show="sheet.id !== 'tab'" @click="clearPicked(sheet)">Clear Selection</button>
           <button type="button" class="control" @click="callRuby(sheet.id + '_refresh')">Refresh</button>
           <button type="button" class="control" @click="callRuby(sheet.id + '_export')">Export CSV</button>
-          <span class="ml-auto tabular-nums"
+          <span class="tabular-nums"
             x-text="(Object.keys(sheet.filters).length ? sheet.count + ' of ' : '') + sheet.rows.length + (sheet.id === 'tab' ? ' component(s)' : ' instance(s)')"></span>
+          <div class="color-controls ml-auto flex items-center">
+            <label class="whitespace-nowrap">Color by
+              <select class="select-control" x-model="sheet.colorBy" @change="callRuby(sheet.id + '_filter', $el.value)">
+                <option value="none">None</option>
+                <template x-for="col in sheet.columns.filter((col) => col.name)" :key="col.id">
+                  <option :value="col.id" x-text="col.name"></option>
+                </template>
+              </select>
+            </label>
+            <button type="button" class="control" @click="callRuby(sheet.id + '_filter', 'none')">Clear colors</button>
+          </div>
         </div>
 
         <div class="sheet-scroll filtered-scroll flex-1 overflow-auto px-3 pb-3">
