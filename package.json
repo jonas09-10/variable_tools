@@ -5,7 +5,7 @@
   "description": "Build and check the Variable Database Tools SketchUp extension",
   "engines": { "node": ">=18" },
   "scripts": {
-    "build": "node scripts/build-rbz.js",
+    "build": "build.bat",
     "test": "node --test && npm run test:ruby",
     "test:ruby": "node scripts/check-ruby.js"
   },
