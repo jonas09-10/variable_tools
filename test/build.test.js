@@ -21,4 +21,13 @@ test('RBZ contains exactly the extension files with unchanged contents', { skip:
   assert.deepEqual(Object.keys(archive).sort(), expected);
   for (const file of expected) assert.deepEqual(Buffer.from(archive[file]), fs.readFileSync(path.join(root, file)));
   assert.ok(archive['variable_tools/main.rb']);
+
+  const dialogPath = 'variable_tools/ui/dialog.html';
+  assert.ok(archive[dialogPath], 'Missing the Variable Database dialog');
+  const html = Buffer.from(archive[dialogPath]).toString('utf8');
+  for (const [, asset] of html.matchAll(/<(?:link|script)\b[^>]*\b(?:href|src)="([^"]+)"/g)) {
+    if (/^https?:\/\//.test(asset)) continue;
+    const archivePath = path.posix.join(path.posix.dirname(dialogPath), asset);
+    assert.ok(archive[archivePath], `Missing dialog asset: ${archivePath}`);
+  }
 });
