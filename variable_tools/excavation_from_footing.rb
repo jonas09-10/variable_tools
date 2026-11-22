@@ -51,6 +51,7 @@ module ExcavationFromFooting
   EPS       = 0.001 # inches, SketchUp's own geometric tolerance
   @last_side  = 300.mm # working space around the footing
   @last_depth = 0.mm   # extra digging below the footing bottom
+  @last_allow_bottom = 'No' # default: a lower face blocks excavation
 
   def self.container?(e)
     e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
@@ -225,7 +226,7 @@ module ExcavationFromFooting
 
   # All faces of the model (world coordinates, outer loop only), skipping the
   # selected entities, hidden things and boxes made by this extension.
-  def self.collect_polys(entities, tr, skip_ids, polys)
+  def self.collect_polys(entities, tr, skip_ids, polys, include_generated = false)
     entities.each do |e|
       next if skip_ids.include?(e.entityID)
       next if e.respond_to?(:hidden?) && e.hidden?
@@ -234,9 +235,9 @@ module ExcavationFromFooting
       if e.is_a?(Sketchup::Face)
         polys << e.outer_loop.vertices.map { |v| v.position.transform(tr) }
       elsif container?(e)
-        next if GENERATED_DICTS.any? { |d| e.get_attribute(d, 'generated') }
+        next if !include_generated && GENERATED_DICTS.any? { |d| e.get_attribute(d, 'generated') }
         ents = e.is_a?(Sketchup::Group) ? e.entities : e.definition.entities
-        collect_polys(ents, tr * e.transformation, skip_ids, polys)
+        collect_polys(ents, tr * e.transformation, skip_ids, polys, include_generated)
       end
     end
   end
@@ -293,6 +294,114 @@ module ExcavationFromFooting
     end
 
     best
+  end
+
+  # Additional check for stepped/irregular footings. A horizontal or inclined
+  # candidate face may lie above part of the actual source outline even when a
+  # single reference from the overall lowest point is not representative.
+  # We intersect face meshes with the XY footprint and test actual vertical
+  # surface hits. The source group is never treated as its own limiting face.
+  def self.limit_z_over_footing(polys, to_frame, cluster, frame, xmin, xmax, ymin, ymax)
+    triangles = []
+    inv = frame.inverse
+    cluster.each { |e| surface_triangles(e, inv, triangles) }
+    return nil if triangles.empty?
+
+    # Interior samples on source triangles, plus samples over the actual
+    # intersection of each candidate with the footprint. Points on perimeter
+    # are inset slightly to avoid floating-point boundary ambiguity.
+    samples = []
+    triangles.each do |tri|
+      a, b, c = tri
+      samples << [(a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0]
+    end
+    samples << [(xmin + xmax) / 2.0, (ymin + ymax) / 2.0]
+    best = nil
+    polys.each do |poly|
+      next if poly.length < 3
+      pts = poly.map do |p|
+        q = p.transform(to_frame)
+        [q.x.to_f, q.y.to_f, q.z.to_f]
+      end
+      next if pts.all? { |p| p[0] < xmin } || pts.all? { |p| p[0] > xmax }
+      next if pts.all? { |p| p[1] < ymin } || pts.all? { |p| p[1] > ymax }
+
+      # Polygon clipping finds its overlap with the target rectangle even when
+      # the overlap misses the selected triangle-centroid samples.
+      clipped = clip(pts, 0, xmin, true)
+      clipped = clip(clipped, 0, xmax, false) if clipped.length >= 3
+      clipped = clip(clipped, 1, ymin, true) if clipped.length >= 3
+      clipped = clip(clipped, 1, ymax, false) if clipped.length >= 3
+      next if clipped.length < 3
+      candidate_points = samples + [[clipped.sum { |v| v[0] } / clipped.length.to_f,
+                                      clipped.sum { |v| v[1] } / clipped.length.to_f]]
+      clipped.each_cons(2) do |a,b|
+        candidate_points << [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
+      end
+      candidate_points.each do |x,y|
+        underside = bottom_at(triangles, x, y)
+        next if underside.nil?
+        # For a polygon on an inclined plane, interpolate its Z at the XY
+        # sample via the plane equation. Vertical faces cannot cap excavation.
+        a, b, c = pts[0,3]
+        ux, uy, uz = b[0]-a[0], b[1]-a[1], b[2]-a[2]
+        vx, vy, vz = c[0]-a[0], c[1]-a[1], c[2]-a[2]
+        nz = ux*vy - uy*vx
+        next if nz.abs < EPS * EPS
+        nx = uy*vz - uz*vy
+        ny = uz*vx - ux*vz
+        z = a[2] - (nx*(x-a[0]) + ny*(y-a[1])) / nz
+        next unless z > underside + EPS
+        # Require the point to be inside the actual candidate polygon; its
+        # bounding rectangle alone is insufficient.
+        inside = false
+        j = pts.length - 1
+        pts.each_index do |i|
+          xi,yi = pts[i][0],pts[i][1]
+          xj,yj = pts[j][0],pts[j][1]
+          inside = !inside if (yi > y) != (yj > y) &&
+            x < (xj-xi)*(y-yi)/(yj-yi) + xi
+          j = i
+        end
+        next unless inside
+        best = z if best.nil? || z < best
+      end
+    end
+    best
+  end
+
+  # True when a non-selected, visible face intersects the excavation footprint
+  # below the selected footing's lowest level. This check deliberately does not
+  # depend on an upper limiting face: a lower obstruction always vetoes the job.
+  # The face is clipped to the XY working-space rectangle and to z < z0 so that
+  # faces elsewhere in the model, or coplanar with the footing bottom, do not
+  # incorrectly block excavation.
+  def self.face_below?(polys, to_frame, xmin, xmax, ymin, ymax, z0)
+    xl = xmin + EPS
+    xh = xmax - EPS
+    yl = ymin + EPS
+    yh = ymax - EPS
+    zl = z0 - EPS
+    return false if xl >= xh || yl >= yh
+
+    polys.each do |poly|
+      next if poly.size < 3
+      pts = poly.map do |p|
+        q = p.transform(to_frame)
+        [q.x.to_f, q.y.to_f, q.z.to_f]
+      end
+      next if pts.all? { |p| p[0] <= xl } || pts.all? { |p| p[0] >= xh }
+      next if pts.all? { |p| p[1] <= yl } || pts.all? { |p| p[1] >= yh }
+      next if pts.all? { |p| p[2] >= zl }
+
+      piece = clip(pts, 0, xl, true)
+      piece = clip(piece, 0, xh, false) if piece.size >= 3
+      piece = clip(piece, 1, yl, true)  if piece.size >= 3
+      piece = clip(piece, 1, yh, false) if piece.size >= 3
+      piece = clip(piece, 2, zl, false) if piece.size >= 3
+      return true if piece.size >= 3
+    end
+    false
   end
 
   # ---------------------------------------------------------------------------
@@ -376,9 +485,9 @@ module ExcavationFromFooting
     face
   end
 
-  # Build a stepped excavation solid from rectangular XY cells. The cell
-  # boundaries are taken from the source geometry's vertices, so horizontal
-  # steps are preserved without depending on SketchUp Pro solid operations.
+  # Form a closed excavation from ONLY the XY cells containing source geometry
+  # (or within the requested working-space offset of that geometry).
+  # Missing cells are genuinely empty; no bounding-box fallback is permitted.
   def self.build_shaped_excavation(context, frame, xs, ys, bottoms, top, name)
     group = context.add_group
     group.name = name
@@ -386,20 +495,20 @@ module ExcavationFromFooting
     nx = xs.length - 1
     ny = ys.length - 1
     point = lambda { |x, y, z| Geom::Point3d.new(x, y, z) }
-    add_outward_face(ents, [point.call(xs[0], ys[0], top),
-      point.call(xs[-1], ys[0], top), point.call(xs[-1], ys[-1], top),
-      point.call(xs[0], ys[-1], top)], Geom::Vector3d.new(0, 0, 1))
     nx.times do |i|
       ny.times do |j|
+        z = bottoms[i][j]
+        next if z.nil?
         x0, x1 = xs[i], xs[i + 1]
         y0, y1 = ys[j], ys[j + 1]
-        z = bottoms[i][j]
+        # The top also follows the active footprint, including concave outlines.
+        add_outward_face(ents, [point.call(x0,y0,top), point.call(x1,y0,top),
+          point.call(x1,y1,top), point.call(x0,y1,top)], Geom::Vector3d.new(0,0,1))
         add_outward_face(ents, [point.call(x0,y0,z), point.call(x0,y1,z),
           point.call(x1,y1,z), point.call(x1,y0,z)], Geom::Vector3d.new(0,0,-1))
-        # Only expose the portion of a wall below the adjacent cell's bottom.
         [[-1,0], [1,0], [0,-1], [0,1]].each do |di,dj|
           ii, jj = i + di, j + dj
-          neighbor = if ii < 0 || ii >= nx || jj < 0 || jj >= ny
+          neighbor = if ii < 0 || ii >= nx || jj < 0 || jj >= ny || bottoms[ii][jj].nil?
                        top
                      else
                        bottoms[ii][jj]
@@ -422,6 +531,7 @@ module ExcavationFromFooting
       end
     end
     cleanup_partition_edges(ents)
+    cleanup_extraneous_lines(ents)
     group.transform!(frame)
     group
   end
@@ -453,37 +563,123 @@ module ExcavationFromFooting
     end
   end
 
+  # Ray/footprint probing above is entirely numerical: it must never leave
+  # SketchUp guide lines or standalone edges in the finished excavation.
+  # Remove only entities that cannot be part of a solid's face boundary.
+  # Face-bearing edges (including genuine steps) must be retained to preserve
+  # topology and reliable SketchUp solid-volume measurements.
+  def self.cleanup_extraneous_lines(entities)
+    entities.grep(Sketchup::ConstructionLine).each do |line|
+      line.erase! if line.valid?
+    end
+    entities.grep(Sketchup::Edge).each do |edge|
+      edge.erase! if edge.valid? && edge.faces.empty?
+    end
+  end
+
+  # Closest point to p on a projected triangle edge, used solely for extending
+  # the true footprint by the specified working-space offset.
+  def self.closest_edge_xy(x, y, a, b)
+    dx = b.x - a.x
+    dy = b.y - a.y
+    len2 = dx * dx + dy * dy
+    t = len2 > EPS * EPS ? ((x - a.x) * dx + (y - a.y) * dy) / len2 : 0.0
+    t = [[t, 0.0].max, 1.0].min
+    px = a.x + t * dx
+    py = a.y + t * dy
+    [(px - x) ** 2 + (py - y) ** 2, a.z + t * (b.z - a.z)]
+  end
+
+  # Return the lower surface at a vertical ray hit. With a nonzero side offset,
+  # also accept the nearest projected edge within that distance, so margins
+  # follow the actual outline, including its concavities, rather than the bbox.
+  def self.footprint_bottom_at(triangles, x, y, side)
+    direct = bottom_at(triangles, x, y)
+    return direct unless direct.nil?
+    return nil if side <= EPS
+    max_distance2 = (side + EPS) ** 2
+    nearest_dist2 = Float::INFINITY
+    nearest_z = nil
+    triangles.each do |tri|
+      a, b, c = tri
+      [[a,b],[b,c],[c,a]].each do |u,v|
+        dist2, z = closest_edge_xy(x, y, u, v)
+        next if dist2 > max_distance2
+        if dist2 < nearest_dist2 - EPS * EPS
+          nearest_dist2 = dist2
+          nearest_z = z
+        elsif (dist2 - nearest_dist2).abs <= EPS * EPS
+          nearest_z = z if nearest_z.nil? || z < nearest_z
+        end
+      end
+    end
+    nearest_z
+  end
+
+  # Add bounded sampling only for diagonal/curved projections and offsets.
+  # Orthogonal stepped footprints retain their exact vertex partitions.
+  def self.partition_axis(values, low, high, max_step)
+    coords = ([low, high] + values.select { |v| v >= low && v <= high }).sort
+    coords = coords.each_with_index.select { |v,i| i == 0 || v - coords[i-1] > EPS }.map(&:first)
+    expanded = [coords.first]
+    coords.each_cons(2) do |a, b|
+      count = [( (b - a) / max_step ).ceil, 1].max
+      (1..count).each { |k| expanded << a + (b - a) * k / count.to_f }
+    end
+    expanded
+  end
+
   def self.shaped_plan(cluster, frame, bb, side, depth, top)
     inverse = frame.inverse
     triangles = []
     cluster.each { |e| surface_triangles(e, inverse, triangles) }
     raise 'Selected footing has no usable faces' if triangles.empty?
-    # Partition at source vertices. For a conventional orthogonal stepped
-    # footing this exactly follows the underside at each elevation.
     x0, x1 = bb.min.x.to_f - side, bb.max.x.to_f + side
     y0, y1 = bb.min.y.to_f - side, bb.max.y.to_f + side
-    xs = ([x0, x1] + triangles.flatten.map { |p| p.x.to_f }).select { |x| x >= x0 && x <= x1 }.sort.uniq
-    ys = ([y0, y1] + triangles.flatten.map { |p| p.y.to_f }).select { |y| y >= y0 && y <= y1 }.sort.uniq
-    xs = xs.each_with_index.select { |v,i| i == 0 || v - xs[i-1] > EPS }.map(&:first)
-    ys = ys.each_with_index.select { |v,i| i == 0 || v - ys[i-1] > EPS }.map(&:first)
-    raise 'Footing is too complex for stepped excavation (over 2500 cells)' if (xs.length - 1) * (ys.length - 1) > 2500
+    verts = triangles.flatten
+    # Rasterize only where needed. Unlike the previous approach, a cell whose
+    # Z-axis ray misses the selected geometry is NOT assigned a bbox elevation.
+    diagonal = triangles.any? do |tri|
+      tri.each_with_index.any? do |a, k|
+        b = tri[(k + 1) % tri.length]
+        (a.x - b.x).abs > EPS && (a.y - b.y).abs > EPS
+      end
+    end
+    span = [(x1 - x0), (y1 - y0)].max
+    max_step = (diagonal || side > EPS) ? [span / 42.0, EPS * 10].max : span + EPS
+    xs = partition_axis(verts.map { |p| p.x.to_f }, x0, x1, max_step)
+    ys = partition_axis(verts.map { |p| p.y.to_f }, y0, y1, max_step)
+    if (xs.length - 1) * (ys.length - 1) > 6000
+      raise 'Footing outline is too complex (over 6000 footprint cells). Simplify the source geometry.'
+    end
     bottoms = Array.new(xs.length - 1) { Array.new(ys.length - 1) }
     volume = 0.0
+    active = 0
+    excluded_above_top = 0
     (xs.length - 1).times do |i|
       (ys.length - 1).times do |j|
         x = (xs[i] + xs[i+1]) / 2.0
         y = (ys[j] + ys[j+1]) / 2.0
-        # Carry the nearest edge's underside elevation into working-space margins.
-        cx = [[x, bb.min.x.to_f + EPS].max, bb.max.x.to_f - EPS].min
-        cy = [[y, bb.min.y.to_f + EPS].max, bb.max.y.to_f - EPS].min
-        bottom = bottom_at(triangles, cx, cy) || bb.min.z.to_f
+        bottom = footprint_bottom_at(triangles, x, y, side)
+        next if bottom.nil? # The XY ray missed: leave this region unexcavated.
         bottom -= depth
-        raise 'Excavation top intersects footing bottom' unless top > bottom + EPS
+        # A stepped footing can have local underside regions higher than the
+        # first limiting face found above its globally lowest point. Such a
+        # region has no positive excavation depth: do not construct an inverted
+        # cell or abort valid, lower regions of the excavation.
+        unless top > bottom + EPS
+          excluded_above_top += 1
+          next
+        end
         bottoms[i][j] = bottom
+        active += 1
         volume += (xs[i+1] - xs[i]) * (ys[j+1] - ys[j]) * (top - bottom)
       end
     end
-    [xs, ys, bottoms, volume]
+    if active == 0
+      raise 'No valid excavation area: the limiting face is at or below the footing underside throughout the detected footprint.'
+    end
+    [xs, ys, bottoms, volume, excluded_above_top]
   end
 
   # ---------------------------------------------------------------------------
@@ -499,18 +695,22 @@ module ExcavationFromFooting
     end
 
     prompts = ['Side offset (working space around the footing, >= 0)',
-               'Extra depth below the footing bottom (>= 0)']
-    result = UI.inputbox(prompts, [@last_side, @last_depth], MENU_NAME)
+               'Extra depth below the footing bottom (>= 0)',
+               'Allow bottom faces?']
+    defaults = [@last_side, @last_depth, @last_allow_bottom]
+    result = UI.inputbox(prompts, defaults, ['', '', 'No|Yes'], MENU_NAME)
     return unless result # cancelled
 
     side  = result[0].to_l
     depth = result[1].to_l
+    allow_bottom = result[2].to_s.strip.casecmp('Yes').zero?
     if side < 0 || depth < 0
       UI.messagebox('The offsets cannot be negative.')
       return
     end
     @last_side  = side
     @last_depth = depth
+    @last_allow_bottom = allow_bottom ? 'Yes' : 'No'
     s = side.to_f
     d = depth.to_f
 
@@ -524,10 +724,11 @@ module ExcavationFromFooting
 
     edit_tr = model.edit_transform
 
-    # Work out every excavation first. If any footing has no limit above it,
-    # nothing is created.
-    plans    = []
-    no_limit = 0
+    # Validate ALL footings before creating geometry. Unless explicitly allowed,
+    # a face below any footing blocks the entire selection regardless of upper faces.
+    plans       = []
+    no_limit    = 0
+    faces_below = 0
     clusters.each do |cluster|
       box = oriented_box(cluster)
       next if box.nil?
@@ -540,13 +741,46 @@ module ExcavationFromFooting
       z0   = bb.min.z.to_f # footing bottom
 
       to_frame = (edit_tr * frame).inverse
+      if !allow_bottom && face_below?(polys, to_frame, xmin, xmax, ymin, ymax, z0)
+        faces_below += 1
+        next
+      end
       z1 = limit_z(polys, to_frame, xmin, xmax, ymin, ymax, z0)
+      # The original broad-footprint clip is fast, but when it cannot locate
+      # a cap, try vertical hits over the *actual* selected geometry.
+      z1 ||= limit_z_over_footing(polys, to_frame, cluster, frame,
+                                  xmin, xmax, ymin, ymax)
+
+      # A bulk excavation surface may itself have been produced by an earlier
+      # excavation/box tool. Those groups are ignored by the normal search to
+      # avoid treating previous outputs as limits. Only if the normal search
+      # finds nothing, retry including these generated groups and REQUIRE an
+      # actual XY point where the candidate face is above the selected solid.
+      # This prevents a supporting footing below the tank from being selected
+      # as its upper limiting surface. The selected objects are still excluded.
+      if z1.nil?
+        generated_polys ||= begin
+          candidates = []
+          collect_polys(model.entities, Geom::Transformation.new,
+                        skip_ids, candidates, true)
+          candidates
+        end
+        z1 = limit_z_over_footing(generated_polys, to_frame, cluster, frame,
+                                   xmin, xmax, ymin, ymax)
+      end
 
       if z1.nil? || z1 - z0 <= EPS
         no_limit += 1
       else
         plans << [cluster, frame, bb, z1]
       end
+    end
+
+    if !allow_bottom && faces_below > 0
+      UI.messagebox("Excavation blocked: a face was detected below #{faces_below} " \
+                    "of the selected footing(s).\nNothing was created.\n\n" \
+                    'Remove or relocate the lower face before generating excavation.')
+      return
     end
 
     if plans.empty? && no_limit == 0
@@ -559,16 +793,20 @@ module ExcavationFromFooting
                     "of the selected footing(s) to stop the excavation.\n" \
                     "Nothing was created.\n\n" \
                     'The top of the excavation needs another face above the footing ' \
-                    '(for example a slab or the ground surface).')
+                    '(for example a slab or ground surface). Check that the ' \
+                    'surface group is visible, overlaps the selected XY footprint, ' \
+                    'and has a face above the selected geometry at that location.')
       return
     end
 
     new_groups = []
     total_in3  = 0.0
+    excluded_above_top_total = 0
     model.start_operation('Excavation From Footing', true)
     begin
       plans.each_with_index do |(cluster, frame, bb, z1), idx|
-        xs, ys, bottoms, vol = shaped_plan(cluster, frame, bb, s, d, z1)
+        xs, ys, bottoms, vol, excluded = shaped_plan(cluster, frame, bb, s, d, z1)
+        excluded_above_top_total += excluded
         g = build_shaped_excavation(model.active_entities, frame, xs, ys,
                                     bottoms, z1, "Excavation #{idx + 1}")
         total_in3 += vol
@@ -579,7 +817,7 @@ module ExcavationFromFooting
         end
         g.set_attribute(ATTR_DICT, 'side_offset', s)
         g.set_attribute(ATTR_DICT, 'extra_depth', d)
-        g.set_attribute(ATTR_DICT, 'height', z1 - bottoms.flatten.min)
+        g.set_attribute(ATTR_DICT, 'height', z1 - bottoms.flatten.compact.min)
         g.set_attribute(ATTR_DICT, 'volume_m3', vol * 1.6387064e-5)
         new_groups << g
       end
@@ -597,6 +835,9 @@ module ExcavationFromFooting
     ft3 = total_in3 / 1728.0
     msg = format("%d excavation(s) created.\nTotal volume: %.3f m\u00B3  (%.1f ft\u00B3)",
                  new_groups.size, m3, ft3)
+    if excluded_above_top_total > 0
+      msg += "\n\n#{excluded_above_top_total} footprint cell(s) were omitted because the footing underside reached or exceeded the limiting top face."
+    end
     Sketchup.status_text = msg.tr("\n", ' ')
     UI.messagebox(msg)
     new_groups

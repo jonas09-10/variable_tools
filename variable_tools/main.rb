@@ -1,11 +1,8 @@
 # encoding: UTF-8
+# Loads every tool. variable_database must come first (the others read from it).
 dir = File.dirname(__FILE__)
-
-# variable_database must come first (the others read from it).
-require File.join(dir, 'variable_database')
-
-# Loads every tool
 %w[
+  variable_database
   box_from_mark
   place_box_from_mark
   box_to_next_face

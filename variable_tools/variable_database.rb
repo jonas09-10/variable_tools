@@ -1444,7 +1444,7 @@ module VariableDB
   # ---------------------------------------------------------------------------
   FILTER_PREFIXES = { 'tab' => 'VDB Filter - ', 'bulk' => 'VDB Bulk Filter - ', 'misc' => 'VDB Misc Filter - ', 'structural' => 'VDB Structural Filter - ' }.freeze
   FILTER_ATTRS    = { 'tab' => 'filter_col',    'bulk' => 'bulk_filter_col', 'misc' => 'misc_filter_col', 'structural' => 'structural_filter_col' }.freeze
-  FILTER_FIXED    = %w[component mark toc gridx gridy name volume top bot].freeze
+  FILTER_FIXED    = %w[component mark toc gridx gridy name volume top bot perimeter height].freeze
 
   # ---- helpers that let the colour filter serve every sheet ('tab', 'bulk', 'misc') ----
   SHEET_JS = { 'tab' => '', 'bulk' => 'Bulk', 'misc' => 'Misc', 'structural' => 'Structural' }.freeze
@@ -1510,6 +1510,10 @@ module VariableDB
   def self.filter_names(sheet = 'tab')
     if bulklike?(sheet)
       h = { 'name' => 'Instance', 'volume' => 'Volume', 'top' => 'Top Elevation', 'bot' => 'Bot Elevation' }
+      if sheet == 'structural'
+        h['perimeter'] = 'Upper Perimeter'
+        h['height'] = 'Height'
+      end
       sheet_columns(sheet).each { |c| h[c['id']] = c['name'].to_s }
     else
       h = { 'component' => 'Component', 'mark' => 'Mark' }
@@ -2005,16 +2009,75 @@ module VariableDB
     @dialog.execute_script("structuralMsg(#{message.to_s.to_json})") if @dialog
   end
 
+  # Bounding-box outputs for Structural Excavation.  Measure vertices in
+  # world coordinates, accounting for nesting, rotations, and instance scales.
+  # Upper perimeter is the perimeter of the global XY bounding rectangle at
+  # the top Z plane, not the outline of an irregular top surface.
+  def self.build_structural_rows(items, cols)
+    memo = {}
+    items.map do |it|
+      entity = it[:entity]
+      points = definition_points(entity.definition, memo)
+      xs = []
+      ys = []
+      zs = []
+      unless points.empty?
+        m = (item_chain(it) * entity.transformation).to_a
+        points.each do |x, y, z|
+          xs << m[0] * x + m[4] * y + m[8] * z + m[12]
+          ys << m[1] * x + m[5] * y + m[9] * z + m[13]
+          zs << m[2] * x + m[6] * y + m[10] * z + m[14]
+        end
+      end
+      vol = item_volume(it)
+      vals = {}
+      cols.each { |c| vals[c['id']] = entity.get_attribute(DICT, c['id']).to_s }
+      measured = !zs.empty?
+      perimeter = measured ? 2.0 * ((xs.max - xs.min) + (ys.max - ys.min)) : nil
+      height = measured ? zs.max - zs.min : nil
+      {
+        'name'      => entity.name.to_s,
+        'volume'    => (vol && vol > 1e-9) ? fmt_volume(vol) : "\u2014",
+        'top'       => measured ? fmt(zs.max) : '',
+        'bot'       => measured ? fmt(zs.min) : '',
+        'perimeter' => perimeter ? fmt(perimeter) : '',
+        'height'    => height ? fmt(height) : '',
+        'vals'      => vals
+      }
+    end
+  end
+
   def self.push_structural
     return unless @dialog
     @structural_items = structural_items
     cols = structural_columns
-    rows = build_bulk_rows(@structural_items, cols)
+    rows = build_structural_rows(@structural_items, cols)
     @structural_data = rows
     @structural_cols = cols
     info = sync_filter('structural', @structural_items, rows)
     info['colors'].each_with_index { |c, i| rows[i]['color'] = c } if info
     @dialog.execute_script("renderStructural(#{JSON.generate('cols' => cols, 'rows' => rows, 'filter' => info)})")
+  end
+
+  # Export the complete Structural Excavation registry, including user columns.
+  # Do not export only visible/filtered rows, matching the other database sheets.
+  def self.export_structural_csv
+    path = UI.savepanel('Export Structural Excavation', nil, 'structural_excavation.csv')
+    return unless path
+    path += '.csv' unless path.downcase.end_with?('.csv')
+
+    cols = structural_columns
+    rows = build_structural_rows(structural_items, cols)
+    CSV.open(path, 'w') do |csv|
+      csv << ['Instance', 'Volume', 'Top Elevation', 'Bot Elevation', 'Upper Perimeter', 'Height'] + cols.map { |c| c['name'] }
+      rows.each do |row|
+        csv << [row['name'], row['volume'], row['top'], row['bot'], row['perimeter'], row['height']] +
+               cols.map { |c| (row['vals'] || {})[c['id']] }
+      end
+    end
+    UI.messagebox("Exported to:\n#{path}")
+  rescue => e
+    UI.messagebox("Structural Excavation export failed: #{e.message}")
   end
 
   def self.generate_structural_excavation
@@ -2025,6 +2088,33 @@ module VariableDB
   def self.generate_structural_berm
     result = InvertedTrapezoidBBox.run(true)
     push_structural if result && !result.empty?
+  end
+
+  # Delete registered excavation/berm instances, not just their table rows.
+  # One operation keeps multi-row deletion undoable as a single SketchUp action.
+  def self.delete_structural_rows(indices)
+    source = @structural_items
+    return unless source
+    requested = Array(indices).map do |index|
+      index.is_a?(Integer) && index >= 0 && index < source.length ? source[index] : nil
+    end.compact
+    targets = requested.map { |item| item[:entity] }.uniq.select do |entity|
+      entity.valid? && entity.get_attribute(DICT, 'structural_excavation')
+    end
+    return if targets.empty?
+
+    model = Sketchup.active_model
+    model.start_operation(targets.length == 1 ? 'Delete Structural Excavation' : 'Delete Structural Excavations', true)
+    begin
+      targets.each { |entity| entity.erase! if entity.valid? }
+      model.commit_operation
+    rescue => error
+      model.abort_operation
+      structural_msg("Could not delete structural excavation: #{error.message}")
+      return
+    end
+    push_structural
+    push_picked(true)
   end
 
   # Only user-defined input cells and the instance name may be edited here.
@@ -2615,7 +2705,7 @@ module VariableDB
     push_bulk
     cols = @bulk_cols || bulk_columns
     CSV.open(path, 'w') do |csv|
-      csv << ['Instance', 'Volume', 'Top Elevation', 'Bot Elevation'] + cols.map { |c| c['name'] }
+      csv << ['Instance', 'Volume', 'Top Elevation', 'Bot Elevation', 'Upper Perimeter', 'Height'] + cols.map { |c| c['name'] }
       (@bulk_data || []).each do |r|
         csv << [r['name'], r['volume'], r['top'], r['bot']] + cols.map { |c| r['vals'][c['id']] }
       end
@@ -2961,7 +3051,7 @@ module VariableDB
     push_misc
     cols = @misc_cols || misc_columns
     CSV.open(path, 'w') do |csv|
-      csv << ['Instance', 'Volume', 'Top Elevation', 'Bot Elevation'] + cols.map { |c| c['name'] }
+      csv << ['Instance', 'Volume', 'Top Elevation', 'Bot Elevation', 'Upper Perimeter', 'Height'] + cols.map { |c| c['name'] }
       (@misc_data || []).each do |r|
         csv << [r['name'], r['volume'], r['top'], r['bot']] + cols.map { |c| r['vals'][c['id']] }
       end
@@ -3445,13 +3535,21 @@ module VariableDB
     @dialog.add_action_callback('tab_rename_col') { |_ctx, payload| rename_tab_column(JSON.parse(payload)) }
     @dialog.add_action_callback('tab_delete_col') { |_ctx, id| delete_tab_column(id.to_s) }
     @dialog.add_action_callback('tab_picked') { |_ctx| push_picked(true) }
+    @dialog.add_action_callback('clear_sheet_selection') do |_ctx|
+      @suppress_picked_until = Time.now + 0.8
+      Sketchup.active_model.selection.clear
+    end
     @dialog.add_action_callback('tab_filter') { |_ctx, col| set_filter('tab', col.to_s) }
 
     # Bulk Excavation sheet
     @dialog.add_action_callback('structural_refresh') { |_ctx| push_structural }
+    @dialog.add_action_callback('structural_export') { |_ctx| defer(:structural_export) { export_structural_csv } }
     @dialog.add_action_callback('structural_generate') { |_ctx| defer(:structural_generate) { generate_structural_excavation } }
     @dialog.add_action_callback('structural_berm') { |_ctx| defer(:structural_berm) { generate_structural_berm } }
     @dialog.add_action_callback('structural_edit') { |_ctx, payload| handle_structural_edit(JSON.parse(payload)) }
+    @dialog.add_action_callback('structural_delete_rows') do |_ctx, payload|
+      delete_structural_rows(JSON.parse(payload))
+    end
     @dialog.add_action_callback('structural_add_col') { |_ctx| add_structural_column }
     @dialog.add_action_callback('structural_rename_col') { |_ctx, payload| rename_structural_column(JSON.parse(payload)) }
     @dialog.add_action_callback('structural_delete_col') { |_ctx, id| delete_structural_column(id.to_s) }
@@ -3705,13 +3803,13 @@ module VariableDB
       .empty { padding: 16px; text-align: center; color: #888; }
 
       /* Footing Tabulation */
-      #schTable, #tabTable, #bulkTable, #miscTable { table-layout: fixed; }
+      #schTable, #tabTable, #bulkTable, #miscTable, #structuralTable { table-layout: fixed; }
       #schTable th, #schTable td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       th .rz { position: absolute; right: 0; top: 0; bottom: 0; width: 7px; cursor: col-resize; z-index: 6; }
       th .rz:hover { background: rgba(59,130,246,0.45); }
       #tabBody input.tocinp { text-align: right; font-variant-numeric: tabular-nums; }
       #tabTable th, #tabTable td, #bulkTable th, #bulkTable td, #miscTable th, #miscTable td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      #tabBody tr, #bulkBody tr, #miscBody tr { cursor: pointer; }
+      #tabBody tr, #bulkBody tr, #miscBody tr, #structuralBody tr { cursor: pointer; }
       #bulkBody td.out { padding: 6px 8px; text-align: right; font-variant-numeric: tabular-nums;
                          background: rgba(136,136,136,0.08); user-select: none; }
       #bulkBody td.swc { padding: 0; text-align: center; }
@@ -3733,14 +3831,14 @@ module VariableDB
       tr.frow th { padding: 3px 4px; z-index: 6; }
       tr.frow select { width: 100%; box-sizing: border-box; font: inherit; font-size: 12px; }
       tr.frow select.on { background-color: rgba(59,130,246,0.28); font-weight: 600; }
-      #tabHead th, #bulkHead th, #miscHead th { top: 76px; top: calc(var(--barh, 46px) + var(--frh, 30px)); }
+      #tabHead th, #bulkHead th, #miscHead th, #structuralHead th { top: 76px; top: calc(var(--barh, 46px) + var(--frh, 30px)); }
       th.colh { padding-right: 4px; }
       th.colh .x { border: 0; background: transparent; color: #dc2626; padding: 0 4px; font-size: 14px; cursor: pointer; }
       th.colh input.hdrinput { width: 70%; box-sizing: border-box; font: inherit; padding: 1px 3px; }
       #tabBody td.txt { padding: 6px 8px; user-select: none; }
       #tabBody td.toc { padding: 6px 8px; text-align: right; font-variant-numeric: tabular-nums;
                         width: 110px; background: #8881; user-select: none; }
-      #tabBody tr.picked td, #bulkBody tr.picked td, #miscBody tr.picked td { background: #3b82f630; }
+      #tabBody tr.picked td, #bulkBody tr.picked td, #miscBody tr.picked td, #structuralBody tr.picked td { background: #3b82f630; }
 
       /* sheet tabs, bottom of the window (Excel style) */
       .tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 2px; z-index: 30;
@@ -3844,6 +3942,8 @@ module VariableDB
           <label title="Paint the instances in the model with one colour per value of this column">Color by
             <select id="bulkColorBy" onchange="sketchup.bulk_filter(this.value)"></select></label>
           <button onclick="sketchup.bulk_filter('none')" title="Restore the original materials and clear the legend">Clear colors</button>
+          <button onclick="selectVisibleRows('bulk')" title="Select all rows currently visible after filters">Select Visible</button>
+          <button onclick="clearSelectedRows('bulk')" title="Clear the selected rows and model selection">Clear Selection</button>
           <button onclick="sketchup.bulk_refresh()" title="Read the model again">Refresh</button>
           <button onclick="sketchup.bulk_export()">Export CSV</button>
           <span class="spacer"></span>
@@ -3873,10 +3973,14 @@ module VariableDB
           <button onclick="sketchup.structural_generate()" title="Generate a shaped excavation from selected footings">Generate Excavation</button>
           <button onclick="sketchup.structural_berm()" title="Create a hollow inverted trapezoid around the selected geometry">Generate Berm</button>
           <button onclick="sketchup.structural_add_col()" title="Add an input column stored on each generated instance">+ Column</button>
+          <button onclick="deletePickedStructural()" title="Delete selected excavation/berm rows AND their generated SketchUp geometry">Delete Selected</button>
           <label title="Paint the listed instances according to a column">Color by
             <select id="structuralColorBy" onchange="sketchup.structural_filter(this.value)"></select></label>
           <button onclick="sketchup.structural_filter('none')">Clear colors</button>
+          <button onclick="selectVisibleRows('structural')" title="Select all rows currently visible after filters">Select Visible</button>
+          <button onclick="clearSelectedRows('structural')" title="Clear the selected rows and model selection">Clear Selection</button>
           <button onclick="sketchup.structural_refresh()">Refresh</button>
+          <button onclick="sketchup.structural_export()">Export CSV</button>
           <span class="spacer"></span><span id="structuralcount"></span>
         </div>
         <div id="structuralLegend" class="legend"></div>
@@ -3887,7 +3991,7 @@ module VariableDB
         </table>
         <div id="structuralempty" class="empty">No structural excavations or berms yet. Select geometry and click Generate Excavation or Generate Berm.</div>
         <div id="structuralmsg"></div>
-        <div class="hint">Generated excavations and berms are registered here. Click to select, double-click to zoom. Add custom columns with + Column; double-click a column heading to rename it, or use its x to delete. Volume and elevations are calculated outputs.</div>
+        <div class="hint">Generated excavations and berms are registered here. Click to select (Ctrl/Shift for multiple rows), double-click to zoom. Edit a custom cell to apply the value to all selected rows. Use the x on a row or Delete Selected to remove BOTH the row and its generated geometry (Undo restores both). Custom columns are managed with + Column and column header controls. Volume, elevations, upper bounding-box perimeter and height are calculated outputs.</div>
       </div>
 
       <!-- ================== Sheet 3: Miscellaneous ========================= -->
@@ -3898,6 +4002,8 @@ module VariableDB
           <label title="Paint the instances in the model with one colour per value of this column">Color by
             <select id="miscColorBy" onchange="sketchup.misc_filter(this.value)"></select></label>
           <button onclick="sketchup.misc_filter('none')" title="Restore the original materials and clear the legend">Clear colors</button>
+          <button onclick="selectVisibleRows('misc')" title="Select all rows currently visible after filters">Select Visible</button>
+          <button onclick="clearSelectedRows('misc')" title="Clear the selected rows and model selection">Clear Selection</button>
           <button onclick="sketchup.misc_refresh()" title="Read the model again">Refresh</button>
           <button onclick="sketchup.misc_export()">Export CSV</button>
           <span class="spacer"></span>
@@ -4229,7 +4335,7 @@ module VariableDB
         tab: ['component', 'mark', 'toc', 'gridx', 'gridy'],
         bulk: ['name', 'volume', 'top', 'bot'],
         misc: ['name', 'volume', 'top', 'bot'],
-        structural: ['name', 'volume', 'top', 'bot']
+        structural: ['name', 'volume', 'top', 'bot', 'perimeter', 'height']
       };
       var tabFilters = {}, bulkFilters = {}, miscFilters = {}, structuralFilters = {};          // column key -> chosen raw value
       var tabRowsData = [], bulkRowsData = [], miscRowsData = [], structuralRowsData = [];       // the rows as last sent by Ruby
@@ -4666,7 +4772,7 @@ module VariableDB
         structuralCols = data.cols || [];
         var rows = data.rows || [];
         structuralRowsData = rows;
-        structuralFilterKeys = [null, 'name', 'volume', 'top', 'bot'].concat(structuralCols.map(function (c) { return c.id; }), [null]);
+        structuralFilterKeys = [null, 'name', 'volume', 'top', 'bot', 'perimeter', 'height'].concat(structuralCols.map(function (c) { return c.id; }), [null]);
         var head = document.getElementById('structuralHead');
         var cg = document.getElementById('structuralCols');
         head.innerHTML = '';
@@ -4692,6 +4798,8 @@ module VariableDB
         addOpt('volume', 'Volume');
         addOpt('top', 'Top Elevation');
         addOpt('bot', 'Bot Elevation');
+        addOpt('perimeter', 'Upper Perimeter');
+        addOpt('height', 'Height');
         structuralCols.forEach(function (c) { addOpt(c.id, c.name); });
         sel.value = (data.filter && data.filter.col) || 'none';
         renderStructuralLegend(data.filter);
@@ -4711,6 +4819,12 @@ module VariableDB
         var thB = makeTh('Bot Elevation', 'out', 'Output: global Z of the lower face.');
         head.appendChild(thB);
         addResizer(thB, 'structural', 'bot', addCol('bot'));
+        var thP = makeTh('Upper Perimeter', 'out', 'Output: perimeter of the upper face of the world-axis-aligned bounding box.');
+        head.appendChild(thP);
+        addResizer(thP, 'structural', 'perimeter', addCol('perimeter'));
+        var thH = makeTh('Height', 'out', 'Output: highest minus lowest global Z elevation.');
+        head.appendChild(thH);
+        addResizer(thH, 'structural', 'height', addCol('height'));
         structuralCols.forEach(function (c) {
           var thc = inputHeader(c, 'structural');
           head.appendChild(thc);
@@ -4750,6 +4864,13 @@ module VariableDB
               if (field !== 'top' && field !== 'bot') { noteEdit('structural', targets, field, inp.value); }
               sketchup.structural_edit(JSON.stringify({ rows: targets, f: field, v: inp.value }));
             });
+            inp.addEventListener('mousedown', function (e) {
+              if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                onStructuralClick(e, i, true);
+              }
+            });
             inp.addEventListener('keydown', function (e) { navigate(e, inp); });
             td.appendChild(inp);
             return td;
@@ -4772,9 +4893,22 @@ module VariableDB
           tr.appendChild(tdV);
           var tdTop = document.createElement('td'); tdTop.className = 'out'; tdTop.textContent = r.top; tr.appendChild(tdTop);
           var tdBot = document.createElement('td'); tdBot.className = 'out'; tdBot.textContent = r.bot; tr.appendChild(tdBot);
+          var tdPerim = document.createElement('td'); tdPerim.className = 'out'; tdPerim.textContent = r.perimeter || ''; tr.appendChild(tdPerim);
+          var tdHeight = document.createElement('td'); tdHeight.className = 'out'; tdHeight.textContent = r.height || ''; tr.appendChild(tdHeight);
           structuralCols.forEach(function (c) { tr.appendChild(inputCell(c.id, r.vals[c.id] || '')); });
 
           var act = document.createElement('td');
+          act.className = 'act';
+          var del = document.createElement('button');
+          del.textContent = '\u00D7';
+          del.title = 'Delete this row and its generated SketchUp geometry';
+          del.addEventListener('click', function (e) {
+            e.stopPropagation();
+            if (confirm('Permanently delete "' + r.name + '" and its generated excavation/berm geometry? You can Undo in SketchUp.')) {
+              sketchup.structural_delete_rows(JSON.stringify([i]));
+            }
+          });
+          act.appendChild(del);
           tr.appendChild(act);
 
           tr.addEventListener('click', function (e) { onStructuralClick(e, i); });
@@ -4792,8 +4926,38 @@ module VariableDB
         sketchup.tab_picked();   // light up the rows that are selected in the model
       }
 
-      function onStructuralClick(e, i) {
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') { return; }
+      function deletePickedStructural() {
+        var indices = Object.keys(structuralPicked).map(Number).filter(function (i) {
+          return rowVisible('structural', i);
+        });
+        if (!indices.length) { structuralMsg('Select one or more visible rows first.'); return; }
+        var count = indices.length;
+        if (confirm('Delete ' + count + ' selected excavation/berm instance' + (count === 1 ? '' : 's') +
+                    ' AND their SketchUp geometry? You can Undo in SketchUp.')) {
+          sketchup.structural_delete_rows(JSON.stringify(indices));
+        }
+      }
+
+      // Consistent multi-row controls for Bulk, Structural, and Miscellaneous.
+      // Only visible rows participate, so filtering never edits hidden entries.
+      function selectVisibleRows(sheet) {
+        var state = sheet === 'bulk' ? bulkPicked : (sheet === 'misc' ? miscPicked : structuralPicked);
+        var rows = sheet === 'bulk' ? bulkRowsData : (sheet === 'misc' ? miscRowsData : structuralRowsData);
+        Object.keys(state).forEach(function (k) { delete state[k]; });
+        for (var i = 0; i < rows.length; i++) { if (rowVisible(sheet, i)) { state[i] = true; } }
+        if (sheet === 'bulk') { paintBulkPicked(); sendBulkSelection(false); }
+        if (sheet === 'misc') { paintMiscPicked(); sendMiscSelection(false); }
+        if (sheet === 'structural') { paintStructuralPicked(); sendStructuralSelection(false); }
+      }
+      function clearSelectedRows(sheet) {
+        if (sheet === 'bulk') { bulkPicked = {}; bulkLast = null; paintBulkPicked(); }
+        if (sheet === 'misc') { miscPicked = {}; miscLast = null; paintMiscPicked(); }
+        if (sheet === 'structural') { structuralPicked = {}; structuralLast = null; paintStructuralPicked(); }
+        sketchup.clear_sheet_selection();
+      }
+
+      function onStructuralClick(e, i, fromInput) {
+        if (!fromInput && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON')) { return; }
         if (e.shiftKey && structuralLast !== null) {
           var a = Math.min(structuralLast, i), b = Math.max(structuralLast, i);
           structuralPicked = {};
@@ -4971,6 +5135,13 @@ module VariableDB
               if (field !== 'top' && field !== 'bot') { noteEdit('bulk', targets, field, inp.value); }
               sketchup.bulk_edit(JSON.stringify({ rows: targets, f: field, v: inp.value }));
             });
+            inp.addEventListener('mousedown', function (e) {
+              if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                onBulkClick(e, i, true);
+              }
+            });
             inp.addEventListener('keydown', function (e) { navigate(e, inp); });
             td.appendChild(inp);
             return td;
@@ -5024,8 +5195,8 @@ module VariableDB
         sketchup.tab_picked();   // light up the rows that are selected in the model
       }
 
-      function onBulkClick(e, i) {
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') { return; }
+      function onBulkClick(e, i, fromInput) {
+        if (!fromInput && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON')) { return; }
         if (e.shiftKey && bulkLast !== null) {
           var a = Math.min(bulkLast, i), b = Math.max(bulkLast, i);
           bulkPicked = {};
@@ -5204,6 +5375,13 @@ module VariableDB
               if (field !== 'top' && field !== 'bot') { noteEdit('misc', targets, field, inp.value); }
               sketchup.misc_edit(JSON.stringify({ rows: targets, f: field, v: inp.value }));
             });
+            inp.addEventListener('mousedown', function (e) {
+              if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                onMiscClick(e, i, true);
+              }
+            });
             inp.addEventListener('keydown', function (e) { navigate(e, inp); });
             td.appendChild(inp);
             return td;
@@ -5257,8 +5435,8 @@ module VariableDB
         sketchup.tab_picked();   // light up the rows that are selected in the model
       }
 
-      function onMiscClick(e, i) {
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') { return; }
+      function onMiscClick(e, i, fromInput) {
+        if (!fromInput && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON')) { return; }
         if (e.shiftKey && miscLast !== null) {
           var a = Math.min(miscLast, i), b = Math.max(miscLast, i);
           miscPicked = {};
