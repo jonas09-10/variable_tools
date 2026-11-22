@@ -41,5 +41,5 @@
 - Keep UI labels and messages consistent with the existing Variable Database terminology.
 
 ## Verification
-- No automated test suite is currently evident in the repository. For Ruby changes, inspect the affected code paths and perform an appropriate SketchUp smoke check when a SketchUp runtime is available.
+- Run `npm ci` to install build dependencies, `npm test` for archive and Ruby syntax checks, and `npm run build` to produce `dist/variable_tools.rbz`. Ruby must be on PATH for syntax checks. These checks do not replace a SketchUp smoke check; use Ruby 2.5 to check the oldest supported syntax.
 - Do not claim a test passed unless it was actually run. For documentation-only changes, review the rendered Markdown and check the symlink target.

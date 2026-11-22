@@ -1,0 +1,13 @@
+{
+  "name": "variable-tools-sketchup",
+  "version": "3.4.0",
+  "private": true,
+  "description": "Build and check the Variable Database Tools SketchUp extension",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "node scripts/build-rbz.js",
+    "test": "node --test && npm run test:ruby",
+    "test:ruby": "node scripts/check-ruby.js"
+  },
+  "devDependencies": { "fflate": "0.8.3" }
+}
