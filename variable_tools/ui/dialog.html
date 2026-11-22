@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Variable Database</title>
+  <link rel="stylesheet" href="tailwind.css">
+  <link rel="stylesheet" href="dialog.css">
+  <script defer src="schedule.js"></script>
+  <script defer src="dialog.js"></script>
+  <script defer src="vendor/alpine-compat.js"></script>
+  <script defer src="vendor/alpine-3.14.9.min.js"></script>
+</head>
+<body x-data="variableDatabase" x-cloak class="flex h-screen flex-col overflow-hidden"
+  @focus.window="refreshSheet()">
+  <main class="flex min-h-0 flex-1 flex-col">
+    <section id="sheet-schedule" x-show="active === 'schedule'" class="flex min-h-0 flex-1 flex-col"
+      aria-label="Footing Schedule">
+      <div class="toolbar flex flex-wrap items-center border-b px-3 py-2">
+        <button type="button" class="control" @click="callRuby('import')"
+          title="Store the selected geometry as a reusable shape for a mark">Import Selection</button>
+        <button type="button" class="control" @click="callRuby('place_mark')"
+          title="Pick a mark, then click in the model to place it">Place Mark</button>
+        <button type="button" class="control" @click="callRuby('refresh')">Refresh Quantity</button>
+        <button type="button" class="control" @click="callRuby('export')">Export CSV</button>
+        <span class="ml-auto tabular-nums" x-text="scheduleRows.length + ' row(s)'"></span>
+      </div>
+      <div class="sheet-scroll flex-1 overflow-auto px-3 pb-3">
+        <table class="data-table table-fixed border-separate border-spacing-0"
+          :style="{ width: tableWidth('schedule', scheduleColumns) }" aria-label="Footing Schedule">
+          <colgroup>
+            <template x-for="col in scheduleColumns" :key="col.id">
+              <col :style="{ width: columnWidth('schedule', col) + 'px' }">
+            </template>
+          </colgroup>
+          <thead>
+            <tr>
+              <template x-for="col in scheduleColumns" :key="col.id">
+                <th scope="col" :title="col.title" :class="{ 'text-right': col.numeric }">
+                  <span x-text="col.name"></span>
+                  <span x-show="col.name" class="resizer absolute inset-y-0 right-0 cursor-col-resize"
+                    title="Drag to resize" @mousedown.prevent.stop="resizeColumn($event, 'schedule', col)"></span>
+                </th>
+              </template>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="(row, index) in scheduleRows" :key="scheduleRevision + '-' + index">
+              <tr :id="'schedule-row-' + index"
+                :class="{ picked: schedulePicked === index, 'opacity-50': dragFrom === index,
+                  'drop-above': dropAt === index && dragFrom > index, 'drop-below': dropAt === index && dragFrom < index }"
+                @dragover="dragOver($event, index)" @drop="dropRow($event, index)">
+                <td class="text-center">
+                  <span class="block cursor-grab select-none" draggable="true"
+                    title="Drag to reorder (or Alt+Up / Alt+Down in a cell)"
+                    @dragstart="startDrag($event, index)" @dragend="endDrag()">≡</span>
+                </td>
+                <template x-for="field in scheduleFields" :key="field.id">
+                  <td :class="{ 'cell-error': scheduleError.index === index && scheduleError.field === field.id }">
+                    <input type="text" class="cell-input w-full" :data-field="field.id" :aria-label="field.name"
+                      :value="row[field.id]" @focus="pickScheduleRow(index, $el)"
+                      @change="editScheduleCell(index, field.id, $el)" @keydown="scheduleKey($event, row, index, field.id)">
+                  </td>
+                </template>
+                <td class="cell-text">
+                  <span x-show="row.shape" x-text="'✓ ' + row.shape"></span>
+                  <button type="button" x-show="row.shape" class="remove-button px-1"
+                    aria-label="Remove the stored shape" title="Remove the stored shape (keeps the dimensions)"
+                    @click="removeScheduleItem('clear_shape', row, index)">×</button>
+                  <span x-show="!row.shape" class="muted">— box</span>
+                </td>
+                <template x-for="col in scheduleOutputs" :key="col.id">
+                  <td class="cell-text output-cell text-right tabular-nums"
+                    :class="{ 'font-semibold': col.id === 'quantity' }" x-text="row[col.id]"></td>
+                </template>
+                <td class="text-center">
+                  <button type="button" class="remove-button px-1" aria-label="Delete row" title="Delete row"
+                    @click="removeScheduleItem('delete', row, index)">×</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <button type="button" class="control mt-2" @click="callRuby('add')">+ Add Row</button>
+        <p x-show="!scheduleRows.length" class="muted py-4 text-center">
+          No rows yet. Click + Add Row or select geometry and click Import Selection.
+        </p>
+        <p role="status" class="message mt-2" x-text="scheduleMessage"></p>
+        <p class="muted mt-1 text-xs">
+          Enter lengths with units (300mm, 1.2m, 12", 4'). Bare numbers use model units.
+          Editing Width, Length, or Thickness resizes every instance of that mark.
+          Reorder rows with the drag handle or Alt+Up / Alt+Down.
+        </p>
+      </div>
+    </section>
+
+    <template x-for="sheet in sheets" :key="sheet.id">
+      <section x-show="active === sheet.id" :id="'sheet-' + sheet.id" :aria-label="sheet.name"
+        class="flex min-h-0 flex-1 flex-col">
+        <div class="toolbar flex flex-wrap items-center border-b px-3 py-2">
+          <template x-for="action in sheet.actions" :key="action.id">
+            <button type="button" class="control" :title="action.title" x-text="action.name"
+              @click="callRuby(sheet.id === 'tab' ? action.id : sheet.id + '_' + action.id)"></button>
+          </template>
+          <button type="button" class="control" @click="callRuby(sheet.id + '_add_col')">+ Column</button>
+          <button type="button" class="control" x-show="sheet.id === 'structural'"
+            title="Delete selected rows and their SketchUp geometry" @click="deletePickedStructural(sheet)">Delete Selected</button>
+          <label class="whitespace-nowrap">Color by
+            <select class="select-control" x-model="sheet.colorBy" @change="callRuby(sheet.id + '_filter', $el.value)">
+              <option value="none">None</option>
+              <template x-for="col in sheet.columns.filter((col) => col.name)" :key="col.id">
+                <option :value="col.id" x-text="col.name"></option>
+              </template>
+            </select>
+          </label>
+          <button type="button" class="control" @click="callRuby(sheet.id + '_filter', 'none')">Clear colors</button>
+          <button type="button" class="control" x-show="sheet.id !== 'tab'" @click="selectVisible(sheet)">Select Visible</button>
+          <button type="button" class="control" x-show="sheet.id !== 'tab'" @click="clearPicked(sheet)">Clear Selection</button>
+          <button type="button" class="control" @click="callRuby(sheet.id + '_refresh')">Refresh</button>
+          <button type="button" class="control" @click="callRuby(sheet.id + '_export')">Export CSV</button>
+          <span class="ml-auto tabular-nums"
+            x-text="(Object.keys(sheet.filters).length ? sheet.count + ' of ' : '') + sheet.rows.length + (sheet.id === 'tab' ? ' component(s)' : ' instance(s)')"></span>
+        </div>
+
+        <div class="sheet-scroll filtered-scroll flex-1 overflow-auto px-3 pb-3">
+          <div x-show="sheet.legend.length" class="toolbar flex flex-wrap py-2">
+            <template x-for="item in sheet.legend" :key="item.rows[0]">
+              <button type="button" class="control rounded-full text-xs" title="Select these instances in the model"
+                @click="sheet.lastPicked = null; selectRows(sheet, item.rows)">
+                <span class="swatch" :style="{ backgroundColor: item.color }"></span>
+                <span x-text="item.value + ' (' + item.count + ')'"></span>
+              </button>
+            </template>
+          </div>
+          <table class="data-table table-fixed border-separate border-spacing-0"
+            :style="{ width: tableWidth(sheet.id, sheet.columns) }" :aria-label="sheet.name">
+            <colgroup>
+              <template x-for="col in sheet.columns" :key="col.id">
+                <col :style="{ width: columnWidth(sheet.id, col) + 'px' }">
+              </template>
+            </colgroup>
+            <thead>
+              <tr class="filter-row">
+                <template x-for="col in sheet.columns" :key="col.id">
+                  <th>
+                    <template x-if="col.name">
+                      <select class="select-control w-full text-xs" :class="{ 'filter-active': hasFilter(sheet, col) }"
+                        :aria-label="'Filter ' + col.name" title="Show only the rows with this value"
+                        @change="changeFilter(sheet, col, $el.value)">
+                        <option value="" :selected="!hasFilter(sheet, col)">All</option>
+                        <template x-for="value in sheet.options[col.id] || []" :key="value">
+                          <option :value="':' + value" :selected="sheet.filters[col.id] === value"
+                            x-text="value === '' ? '(blank)' : value"></option>
+                        </template>
+                      </select>
+                    </template>
+                  </th>
+                </template>
+              </tr>
+              <tr>
+                <template x-for="col in sheet.columns" :key="col.id">
+                  <th scope="col" :class="{ 'text-right': col.numeric }">
+                    <span x-show="sheet.renaming !== col.id" x-text="col.name"
+                      :title="col.custom ? 'Double-click to rename this column' : col.title"
+                      @dblclick="if (col.custom) sheet.renaming = col.id"></span>
+                    <template x-if="sheet.renaming === col.id">
+                      <input type="text" class="cell-input w-full" :value="col.name" aria-label="Column name"
+                        x-init="$nextTick(() => { $el.focus(); $el.select(); })"
+                        @keydown.enter.prevent="finishRename(sheet, col, $el.value)"
+                        @keydown.escape.prevent="sheet.renaming = null" @blur="finishRename(sheet, col, $el.value)">
+                    </template>
+                    <button type="button" x-show="col.custom && sheet.renaming !== col.id" class="remove-button px-1"
+                      :aria-label="'Delete column ' + col.name" title="Delete this column and its stored values"
+                      @click="deleteColumn(sheet, col)">×</button>
+                    <span x-show="col.name" class="resizer absolute inset-y-0 right-0 cursor-col-resize"
+                      title="Drag to resize" @mousedown.prevent.stop="resizeColumn($event, sheet.id, col)"></span>
+                  </th>
+                </template>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="(row, index) in sheet.rows" :key="sheet.revision + '-' + index">
+                <tr x-show="sheet.visible[index]" :id="sheet.id + '-row-' + index" class="cursor-pointer"
+                  :class="{ picked: sheet.picked.has(index) }" @click="clickRow(sheet, index, $event)"
+                  @dblclick="if (!$event.target.closest('input, button')) selectRows(sheet, [...sheet.picked], true)">
+                  <template x-for="col in sheet.columns" :key="col.id">
+                    <td :class="{ 'text-center': !col.name, 'text-right tabular-nums': col.numeric && !col.grid, 'output-cell': col.numeric && !col.edit }">
+                      <template x-if="col.edit">
+                        <input type="text" class="cell-input w-full" :class="{ 'auto-grid': col.grid && row[col.grid] }"
+                          :readonly="Boolean(col.grid && row[col.grid])" :aria-label="col.name"
+                          :title="col.grid ? (row[col.grid] ? 'From gridlines cutting through this component' : 'Enter a grid label by hand') : null"
+                          x-effect="sheet.outputRevision; syncSheetInput($el, cellValue(row, col))"
+                          @mousedown="selectFromInput(sheet, index, $event)" @keydown="navigate($event)"
+                          @change="editCell(sheet, index, col, $el)">
+                      </template>
+                      <template x-if="col.name && !col.edit">
+                        <span class="cell-text block truncate">
+                          <span x-show="col.id === 'component' && row.color" class="swatch mr-1"
+                            :style="{ backgroundColor: row.color }"></span>
+                          <span x-text="cellValue(row, col)"></span>
+                        </span>
+                      </template>
+                      <template x-if="col.id === 'swatch' && row.color">
+                        <span class="swatch" :style="{ backgroundColor: row.color }"></span>
+                      </template>
+                      <template x-if="col.id === 'remove'">
+                        <button type="button" class="remove-button px-1"
+                          :aria-label="sheet.id === 'structural' ? 'Delete row and its geometry' : 'Remove from this sheet'"
+                          :title="sheet.id === 'structural' ? 'Delete row and its geometry' : 'Remove from this sheet (geometry stays in the model)'"
+                          @click.stop="removeInstance(sheet, index)">×</button>
+                      </template>
+                    </td>
+                  </template>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <p x-show="!sheet.rows.length" class="muted py-4 text-center" x-text="sheet.empty"></p>
+          <p role="status" class="message mt-2" x-text="sheet.message"></p>
+          <p class="muted mt-1 text-xs">
+            Ctrl-click or Shift-click to select multiple rows. Double-click a row to zoom or a custom column name to rename it.
+            Drag the edge of a column header to resize it.
+          </p>
+        </div>
+      </section>
+    </template>
+  </main>
+
+  <nav aria-label="Database sheets" class="sheet-tabs flex flex-wrap border-t px-3">
+    <button type="button" class="sheet-tab whitespace-nowrap px-3 py-2" aria-controls="sheet-schedule"
+      :aria-pressed="active === 'schedule'" @click="switchSheet('schedule')">Footing Schedule</button>
+    <template x-for="sheet in sheets" :key="sheet.id">
+      <button type="button" class="sheet-tab whitespace-nowrap px-3 py-2" :aria-controls="'sheet-' + sheet.id"
+        :aria-pressed="active === sheet.id" @click="switchSheet(sheet.id)" x-text="sheet.name"></button>
+    </template>
+  </nav>
+</body>
+</html>
